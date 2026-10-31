@@ -6,31 +6,44 @@ cd "$DIR"
 
 echo "🤖 Starting FRIDAY local environment..."
 
-# Check / initialize backend venv
-if [ ! -d "backend/.venv" ]; then
-    echo "📦 Creating Python virtual environment in backend/.venv..."
-    /opt/homebrew/bin/python3.11 -m venv backend/.venv || python3 -m venv backend/.venv
-    source backend/.venv/bin/activate
-    pip install --upgrade pip
-    pip install -e "backend[dev]"
+# 1. Check / initialize virtual environment (supports root .venv or backend/.venv)
+if [ -d "$DIR/backend/.venv" ]; then
+    source "$DIR/backend/.venv/bin/activate"
+elif [ -d "$DIR/.venv" ]; then
+    source "$DIR/.venv/bin/activate"
 else
-    source backend/.venv/bin/activate
+    echo "📦 Creating Python virtual environment in backend/.venv..."
+    /opt/homebrew/bin/python3.11 -m venv "$DIR/backend/.venv" 2>/dev/null || python3 -m venv "$DIR/backend/.venv"
+    source "$DIR/backend/.venv/bin/activate"
 fi
 
-# Ensure .env exists in backend
-if [ ! -f "backend/.env" ]; then
+# Ensure uvicorn, greenlet, and backend packages are installed
+if ! command -v uvicorn >/dev/null 2>&1 || ! python -c "import greenlet" >/dev/null 2>&1; then
+    echo "📦 Installing/verifying backend dependencies (including greenlet for SQLAlchemy)..."
+    pip install -r "$DIR/backend/requirements.txt"
+fi
+
+# 2. Ensure frontend packages are installed
+if [ ! -d "$DIR/frontend/node_modules" ] || [ ! -f "$DIR/frontend/node_modules/.bin/vite" ]; then
+    echo "📦 Installing frontend dependencies (npm install)..."
+    (cd "$DIR/frontend" && npm install)
+fi
+
+# 3. Ensure .env exists in backend
+if [ ! -f "$DIR/backend/.env" ]; then
     echo "📄 Creating backend/.env from backend/.env.example..."
-    cp backend/.env.example backend/.env
+    cp "$DIR/backend/.env.example" "$DIR/backend/.env"
 fi
 
 # Function to kill all subprocesses on EXIT
 cleanup() {
+    echo ""
     echo "🛑 Shutting down FRIDAY services..."
     kill $(jobs -p) 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-# Start Backend
+# 4. Start Backend
 echo "🚀 Starting FastAPI backend on http://127.0.0.1:8765..."
 cd "$DIR/backend"
 uvicorn app.main:app --host 127.0.0.1 --port 8765 --reload &
@@ -41,20 +54,19 @@ cd "$DIR"
 echo "⏳ Waiting for backend to become healthy..."
 for i in {1..20}; do
     if curl -s http://127.0.0.1:8765/health > /dev/null; then
-        echo "✅ Backend is healthy!"
+        echo "✅ Backend is healthy at http://127.0.0.1:8765!"
         break
     fi
     sleep 0.5
 done
 
-# Check if Tauri and Cargo are available
+# 5. Check if Tauri and Cargo are available
 if command -v cargo >/dev/null 2>&1; then
     echo "🦀 Launching via Tauri Desktop Shell..."
     npm run tauri dev
 else
-    echo "🌐 Cargo/Rust not detected in PATH. Starting Vite web frontend directly at http://localhost:1420..."
-    echo "💡 Note: To launch as a native macOS Tauri app, install Rust: 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh' or 'brew install rust'"
+    echo "🌐 Starting Vite web frontend directly at http://localhost:1420..."
+    echo "💡 Note: To launch as a native macOS Tauri app, install Rust: 'brew install rust' or 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh'"
     cd "$DIR/frontend"
     npm run dev
 fi
-
