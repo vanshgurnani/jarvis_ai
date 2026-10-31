@@ -19,6 +19,12 @@ pub fn run() {
                 }
             }
 
+            // Check if backend is already running
+            if std::net::TcpStream::connect("127.0.0.1:8765").is_ok() {
+                println!("⚡ FRIDAY Backend is already running on port 8765. Attached.");
+                return Ok(());
+            }
+
             let python_bin = backend_dir.join("backend/.venv/bin/python3");
             let python_cmd = if python_bin.exists() {
                 python_bin.to_string_lossy().to_string()

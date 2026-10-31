@@ -101,13 +101,14 @@ export async function streamChat(
       if (done) break;
 
       buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n\n");
-      buffer = lines.pop() || "";
+      const rawLines = buffer.split(/\r?\n/);
+      buffer = rawLines.pop() || "";
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith("data: ")) {
-          const jsonStr = trimmed.slice(6);
+      for (const rawLine of rawLines) {
+        const trimmed = rawLine.trim();
+        if (trimmed.startsWith("data:")) {
+          const jsonStr = trimmed.slice(5).trim();
+          if (!jsonStr) continue;
           try {
             const data = JSON.parse(jsonStr);
             if (data.type === "content") {
@@ -181,5 +182,21 @@ export async function updateLLMSettings(settings: {
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+export async function transcribeAudio(audioBlob: Blob): Promise<string> {
+  const formData = new FormData();
+  formData.append("file", audioBlob, "recording.webm");
+  try {
+    const res = await fetch(`${BACKEND_BASE}/voice/transcribe`, {
+      method: "POST",
+      body: formData,
+    });
+    if (!res.ok) return "";
+    const data = await res.json();
+    return data.text || "";
+  } catch {
+    return "";
   }
 }

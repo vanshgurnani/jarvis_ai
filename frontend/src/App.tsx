@@ -6,9 +6,9 @@ import {
   VolumeX,
   Settings,
   Database,
-  Terminal,
   Send,
   Zap,
+  RotateCcw,
 } from "lucide-react";
 import { JarvisGlobe, JarvisState } from "./components/JarvisGlobe";
 import { MemoryModal } from "./components/MemoryModal";
@@ -18,6 +18,7 @@ import {
   streamChat,
   synthesizeSpeech,
   fetchLLMSettings,
+  transcribeAudio,
 } from "./lib/api";
 
 export const App: React.FC = () => {
@@ -27,26 +28,29 @@ export const App: React.FC = () => {
   const [modelName, setModelName] = useState("@cf/meta/llama-3.2-3b-instruct");
   const [autoSpeak, setAutoSpeak] = useState(true);
 
-  // HUD readouts
+  // HUD Readouts
   const [userTranscript, setUserTranscript] = useState<string>("");
   const [jarvisSpeech, setJarvisSpeech] = useState<string>(
-    "All systems online. J.A.R.V.I.S. neural interface initialized and standing by, sir."
+    "J.A.R.V.I.S. neural core online. All systems fully operational, sir. Tap the holographic sphere or enter a directive below."
   );
-  const [commandInput, setCommandInput] = useState<string>("");
-  const [showCommandLine, setShowCommandLine] = useState<boolean>(false);
+  const [directiveInput, setDirectiveInput] = useState<string>("");
 
   // Modals
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isMemoryOpen, setIsMemoryOpen] = useState(false);
 
-  // Audio / Speech recognition refs
+  // Audio / Speech refs
   const recognitionRef = useRef<any>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
   const currentAudioRef = useRef<HTMLAudioElement | null>(null);
   const animFrameRef = useRef<number>(0);
+  const transcriptCapturedRef = useRef<string>("");
 
-  // Check backend health & fetch active model
+  // Initial health check & model fetch
   useEffect(() => {
     const init = async () => {
       const healthy = await checkBackendHealth();
@@ -64,7 +68,7 @@ export const App: React.FC = () => {
     return () => clearInterval(interval);
   }, []);
 
-  // Web Speech Recognition setup
+  // Initialize Web Speech Recognition if available (in Chrome / Safari with dictation)
   useEffect(() => {
     const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
     if (SpeechRec) {
@@ -73,44 +77,35 @@ export const App: React.FC = () => {
       rec.interimResults = true;
       rec.lang = "en-US";
 
-      rec.onstart = () => {
-        setJarvisState("listening");
-        startMicAudioAnalysis();
-      };
-
       rec.onresult = (event: any) => {
         let transcript = "";
         for (let i = event.resultIndex; i < event.results.length; i++) {
           transcript += event.results[i][0].transcript;
         }
-        setUserTranscript(transcript);
-        if (event.results[0].isFinal) {
-          stopMicAudioAnalysis();
-          handleExecuteDirective(transcript);
+        if (transcript.trim()) {
+          transcriptCapturedRef.current = transcript.trim();
+          setUserTranscript(transcript.trim());
         }
       };
 
-      rec.onerror = (event: any) => {
-        console.warn("Speech recognition error:", event.error);
-        stopMicAudioAnalysis();
-        setJarvisState("idle");
+      rec.onerror = (e: any) => {
+        console.warn("SpeechRec warning:", e.error);
       };
 
       rec.onend = () => {
-        stopMicAudioAnalysis();
-        if (jarvisState === "listening") {
-          setJarvisState("idle");
-        }
+        // Recognition completed
       };
 
       recognitionRef.current = rec;
     }
-  }, [jarvisState]);
+  }, []);
 
   // Audio analysis for Mic
-  const startMicAudioAnalysis = async () => {
+  const startMic = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = stream;
+
       const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 64;
@@ -122,54 +117,122 @@ export const App: React.FC = () => {
 
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       const updateLevel = () => {
-        analyser.getByteFrequencyData(dataArray);
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
         let sum = 0;
         for (let i = 0; i < dataArray.length; i++) {
           sum += dataArray[i];
         }
         const avg = sum / dataArray.length;
-        setAudioLevel(Math.min(1.0, avg / 128));
+        setAudioLevel(Math.min(1.0, avg / 110));
         animFrameRef.current = requestAnimationFrame(updateLevel);
       };
       updateLevel();
-    } catch (e) {
-      console.warn("Audio analysis unavailable:", e);
+
+      // Setup MediaRecorder as universal fallback
+      if (typeof MediaRecorder !== "undefined") {
+        audioChunksRef.current = [];
+        const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+          ? "audio/webm;codecs=opus"
+          : MediaRecorder.isTypeSupported("audio/mp4")
+          ? "audio/mp4"
+          : "";
+        const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) {
+            audioChunksRef.current.push(e.data);
+          }
+        };
+
+        recorder.start(100);
+        mediaRecorderRef.current = recorder;
+      }
+
+      // Try starting SpeechRecognition simultaneously
+      transcriptCapturedRef.current = "";
+      try {
+        recognitionRef.current?.start();
+      } catch {
+        // Ignore if already started
+      }
+    } catch (err) {
+      console.warn("Microphone access failed:", err);
+      setJarvisState("error");
+      setJarvisSpeech("Microphone permission required for vocal directives, sir. You can also type directly in the directive bar below.");
     }
   };
 
-  const stopMicAudioAnalysis = () => {
+  const stopMic = async (): Promise<Blob | null> => {
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     if (audioContextRef.current) {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
     }
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach((t) => t.stop());
+      micStreamRef.current = null;
+    }
+    try {
+      recognitionRef.current?.stop();
+    } catch {}
+
     setAudioLevel(0);
+
+    return new Promise((resolve) => {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.onstop = () => {
+          const blob = new Blob(audioChunksRef.current, {
+            type: mediaRecorderRef.current?.mimeType || "audio/webm",
+          });
+          resolve(blob);
+        };
+        mediaRecorderRef.current.stop();
+      } else {
+        resolve(null);
+      }
+    });
   };
 
-  // Toggle Voice Input
-  const handleToggleListening = () => {
+  // Toggle Voice Listening
+  const handleToggleListening = async () => {
+    // If speaking, clicking interrupts speech
     if (currentAudioRef.current) {
       currentAudioRef.current.pause();
       currentAudioRef.current = null;
     }
 
     if (jarvisState === "listening") {
-      recognitionRef.current?.stop();
-      stopMicAudioAnalysis();
-      setJarvisState("idle");
+      setJarvisState("thinking");
+      const audioBlob = await stopMic();
+
+      // Check if we captured speech via SpeechRecognition
+      const captured = transcriptCapturedRef.current.trim();
+      if (captured) {
+        handleExecuteDirective(captured);
+      } else if (audioBlob && audioBlob.size > 500) {
+        // Fallback to backend transcription
+        setJarvisSpeech("Processing vocal waveform...");
+        const text = await transcribeAudio(audioBlob);
+        if (text && !text.startsWith("[")) {
+          handleExecuteDirective(text);
+        } else {
+          setJarvisState("idle");
+          setJarvisSpeech("Vocal input received, but no clear speech recognized. Please state directive or type below, sir.");
+        }
+      } else {
+        setJarvisState("idle");
+        setJarvisSpeech("Standing by for directive.");
+      }
     } else {
       setUserTranscript("");
-      setJarvisSpeech("Listening for directive...");
-      try {
-        recognitionRef.current?.start();
-      } catch {
-        // Fallback if already running or not supported
-        setJarvisState("listening");
-      }
+      setJarvisSpeech("Listening for vocal directive... Tap globe again or press mic when done.");
+      setJarvisState("listening");
+      await startMic();
     }
   };
 
-  // Execute directive via Custom LLM Backend
+  // Execute directive through Custom LLM Backend
   const handleExecuteDirective = async (promptText: string) => {
     const cleanPrompt = promptText.trim();
     if (!cleanPrompt) return;
@@ -190,7 +253,6 @@ export const App: React.FC = () => {
         setJarvisState("speaking");
         if (autoSpeak && accumulated.trim()) {
           try {
-            // Audio reactivity for speech
             const audio = await synthesizeSpeech(accumulated);
             if (audio) {
               currentAudioRef.current = audio;
@@ -200,15 +262,15 @@ export const App: React.FC = () => {
               };
               audio.play();
 
-              // Synthetic visual audio oscillation
-              const interval = setInterval(() => {
+              // Pulsing audio reactivity simulation while speaking
+              const pulseInterval = setInterval(() => {
                 if (audio.ended || audio.paused) {
-                  clearInterval(interval);
+                  clearInterval(pulseInterval);
                   setAudioLevel(0);
                 } else {
-                  setAudioLevel(0.2 + Math.random() * 0.6);
+                  setAudioLevel(0.15 + Math.random() * 0.55);
                 }
-              }, 100);
+              }, 120);
             } else {
               setJarvisState("idle");
             }
@@ -221,45 +283,56 @@ export const App: React.FC = () => {
       },
       (err) => {
         setJarvisState("error");
-        setJarvisSpeech(`⚠️ Directive execution failed: ${err}`);
+        setJarvisSpeech(`⚠️ Directive error: ${err}`);
       }
     );
   };
 
-  const handleCommandSubmit = (e: React.FormEvent) => {
+  const handleDirectiveSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!commandInput.trim()) return;
-    const text = commandInput.trim();
-    setCommandInput("");
+    if (!directiveInput.trim()) return;
+    const text = directiveInput.trim();
+    setDirectiveInput("");
     handleExecuteDirective(text);
   };
 
-  return (
-    <div className="relative flex flex-col h-screen w-screen bg-[#030712] text-neutral-100 font-mono select-none overflow-hidden">
-      {/* Background Cyber Grid / HUD Canvas Layer */}
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(6,182,212,0.08)_0%,rgba(0,0,0,0.95)_75%)] pointer-events-none" />
-      <div className="absolute inset-0 bg-[linear-gradient(rgba(6,182,212,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(6,182,212,0.03)_1px,transparent_1px)] bg-[size:40px_40px] pointer-events-none" />
+  const handleResetCore = () => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    stopMic();
+    setJarvisState("idle");
+    setUserTranscript("");
+    setJarvisSpeech("J.A.R.V.I.S. neural interface recalibrated. Standing by, sir.");
+  };
 
-      {/* Futuristic Corner HUD Accents */}
+  return (
+    <div className="relative flex flex-col h-screen w-screen bg-[#020617] text-neutral-100 font-mono select-none overflow-hidden">
+      {/* Background Holographic Atmospheric Layer */}
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(6,182,212,0.1)_0%,rgba(0,0,0,0.98)_80%)] pointer-events-none" />
+      <div className="absolute inset-0 bg-[linear-gradient(rgba(6,182,212,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(6,182,212,0.03)_1px,transparent_1px)] bg-[size:44px_44px] pointer-events-none" />
+
+      {/* Futuristic Corner HUD Brackets */}
       <div className="absolute top-3 left-3 w-4 h-4 border-t-2 border-l-2 border-cyan-500/60 pointer-events-none" />
       <div className="absolute top-3 right-3 w-4 h-4 border-t-2 border-r-2 border-cyan-500/60 pointer-events-none" />
       <div className="absolute bottom-3 left-3 w-4 h-4 border-b-2 border-l-2 border-cyan-500/60 pointer-events-none" />
       <div className="absolute bottom-3 right-3 w-4 h-4 border-b-2 border-r-2 border-cyan-500/60 pointer-events-none" />
 
       {/* TOP HUD BAR */}
-      <header className="relative z-10 flex items-center justify-between px-6 py-4 border-b border-cyan-950/80 bg-neutral-950/40 backdrop-blur-md">
+      <header className="relative z-10 flex items-center justify-between px-5 py-3 border-b border-cyan-950/70 bg-neutral-950/50 backdrop-blur-md">
         {/* Stark / Jarvis ID Badge */}
         <div className="flex items-center space-x-3">
-          <div className="relative flex items-center justify-center w-9 h-9 rounded-lg bg-cyan-950/60 border border-cyan-500/40 friday-core-glow">
-            <Zap className="w-5 h-5 text-cyan-400" />
+          <div className="relative flex items-center justify-center w-8 h-8 rounded-lg bg-cyan-950/80 border border-cyan-500/50 friday-core-glow">
+            <Zap className="w-4 h-4 text-cyan-400" />
           </div>
           <div>
             <div className="flex items-center space-x-2">
-              <span className="font-bold text-sm tracking-widest text-cyan-400 drop-shadow-[0_0_8px_rgba(6,182,212,0.8)]">
+              <span className="font-bold text-sm tracking-widest text-cyan-400 drop-shadow-[0_0_10px_rgba(6,182,212,0.8)]">
                 J.A.R.V.I.S.
               </span>
               <span className="text-[10px] uppercase px-1.5 py-0.5 rounded bg-cyan-950/80 text-cyan-300 border border-cyan-500/30">
-                MARK VII // AI
+                CORE // MARK VII
               </span>
             </div>
             <div className="flex items-center space-x-2 text-[10px] text-neutral-400 mt-0.5">
@@ -267,14 +340,14 @@ export const App: React.FC = () => {
                 className={`w-1.5 h-1.5 rounded-full ${
                   backendHealthy
                     ? "bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.9)]"
-                    : "bg-rose-500"
+                    : "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.9)]"
                 }`}
               />
               <span className="text-neutral-300 font-mono tracking-tight">
-                {backendHealthy ? "ONLINE // 127.0.0.1:8765" : "SIDECAR OFFLINE"}
+                {backendHealthy ? "ONLINE" : "OFFLINE"}
               </span>
-              <span className="text-neutral-600">|</span>
-              <span className="text-cyan-500/80 truncate max-w-[140px] sm:max-w-[200px]">
+              <span className="text-neutral-600">•</span>
+              <span className="text-cyan-500/80 truncate max-w-[150px] sm:max-w-[220px]">
                 {modelName}
               </span>
             </div>
@@ -282,25 +355,21 @@ export const App: React.FC = () => {
         </div>
 
         {/* Top Right HUD Controls */}
-        <div className="flex items-center space-x-2">
-          {/* Toggle Command Prompt */}
+        <div className="flex items-center space-x-1.5">
+          {/* Reset Core Button */}
           <button
-            onClick={() => setShowCommandLine(!showCommandLine)}
-            title="Toggle Command Directive Input"
-            className={`p-2 rounded-lg border transition ${
-              showCommandLine
-                ? "bg-cyan-950/80 border-cyan-500/60 text-cyan-300"
-                : "border-neutral-800 text-neutral-400 hover:text-cyan-400 hover:bg-neutral-900"
-            }`}
+            onClick={handleResetCore}
+            title="Recalibrate Core & Reset"
+            className="p-1.5 rounded-lg border border-neutral-800 text-neutral-400 hover:text-cyan-400 hover:bg-neutral-900 transition"
           >
-            <Terminal className="w-4 h-4" />
+            <RotateCcw className="w-4 h-4" />
           </button>
 
           {/* Voice Mute Toggle */}
           <button
             onClick={() => setAutoSpeak(!autoSpeak)}
-            title={autoSpeak ? "Voice Synthesis Active" : "Voice Synthesis Muted"}
-            className={`p-2 rounded-lg border transition ${
+            title={autoSpeak ? "Voice Output Active" : "Voice Output Muted"}
+            className={`p-1.5 rounded-lg border transition ${
               autoSpeak
                 ? "bg-cyan-950/80 border-cyan-500/60 text-cyan-400 shadow-[0_0_10px_rgba(6,182,212,0.3)]"
                 : "border-neutral-800 text-neutral-500 hover:text-neutral-300 hover:bg-neutral-900"
@@ -313,16 +382,16 @@ export const App: React.FC = () => {
           <button
             onClick={() => setIsMemoryOpen(true)}
             title="Core Memory & Directives"
-            className="p-2 rounded-lg border border-neutral-800 text-neutral-400 hover:text-cyan-400 hover:bg-neutral-900 transition"
+            className="p-1.5 rounded-lg border border-neutral-800 text-neutral-400 hover:text-cyan-400 hover:bg-neutral-900 transition"
           >
             <Database className="w-4 h-4" />
           </button>
 
-          {/* LLM & Gateway Settings Modal */}
+          {/* Settings Modal */}
           <button
             onClick={() => setIsSettingsOpen(true)}
-            title="Gateway & Model Configuration"
-            className="p-2 rounded-lg border border-neutral-800 text-neutral-400 hover:text-cyan-400 hover:bg-neutral-900 transition"
+            title="LLM Gateway & Model Configuration"
+            className="p-1.5 rounded-lg border border-neutral-800 text-neutral-400 hover:text-cyan-400 hover:bg-neutral-900 transition"
           >
             <Settings className="w-4 h-4" />
           </button>
@@ -330,20 +399,20 @@ export const App: React.FC = () => {
       </header>
 
       {/* CENTER STAGE: 3D HOLOGRAPHIC JARVIS GLOBE */}
-      <main className="relative flex-1 flex flex-col items-center justify-center p-4">
-        {/* Circular Orbital HUD Ring Behind Globe */}
-        <div className="absolute w-[380px] h-[380px] sm:w-[440px] sm:h-[440px] rounded-full border border-cyan-500/15 pointer-events-none animate-spin-slow" />
-        <div className="absolute w-[320px] h-[320px] sm:w-[380px] sm:h-[380px] rounded-full border border-dashed border-cyan-500/20 pointer-events-none" />
+      <main className="relative flex-1 flex flex-col items-center justify-center p-2 min-h-0">
+        {/* Orbital HUD Circles */}
+        <div className="absolute w-[340px] h-[340px] sm:w-[420px] sm:h-[420px] rounded-full border border-cyan-500/15 pointer-events-none animate-spin-slow" />
+        <div className="absolute w-[300px] h-[300px] sm:w-[370px] sm:h-[370px] rounded-full border border-dashed border-cyan-500/20 pointer-events-none" />
 
-        {/* The 3D Interactive Jarvis Globe */}
+        {/* Interactive 3D Holographic Globe */}
         <JarvisGlobe
           state={jarvisState}
           audioLevel={audioLevel}
           onClick={handleToggleListening}
         />
 
-        {/* State Telemetry Indicator */}
-        <div className="mt-4 flex items-center space-x-2 text-xs font-mono tracking-widest uppercase">
+        {/* State Telemetry Badge */}
+        <div className="mt-2 flex items-center space-x-2 text-xs font-mono tracking-widest uppercase">
           <span
             className={`w-2 h-2 rounded-full ${
               jarvisState === "listening"
@@ -353,30 +422,30 @@ export const App: React.FC = () => {
                 : jarvisState === "speaking"
                 ? "bg-teal-400 animate-bounce shadow-[0_0_10px_#2dd4bf]"
                 : jarvisState === "error"
-                ? "bg-rose-500 animate-pulse"
-                : "bg-cyan-600/70"
+                ? "bg-rose-500 animate-pulse shadow-[0_0_10px_#f43f5e]"
+                : "bg-cyan-500/70"
             }`}
           />
-          <span className="text-cyan-300 font-semibold drop-shadow-[0_0_6px_rgba(6,182,212,0.6)]">
+          <span className="text-cyan-300 font-semibold drop-shadow-[0_0_6px_rgba(6,182,212,0.6)] text-[11px] sm:text-xs">
             {jarvisState === "listening"
-              ? "[ SYSTEM: RECORDING VOCAL INPUT... ]"
+              ? "[ RECORDING VOCAL INPUT... TAP TO FINISH ]"
               : jarvisState === "thinking"
-              ? "[ NEURAL CORE: COMPUTING DIRECTIVE... ]"
+              ? "[ NEURAL COMPUTE // LLAMA-3.2 ACTIVE ]"
               : jarvisState === "speaking"
-              ? "[ AUDIO BUS: VOCALIZING SYNTHESIS... ]"
+              ? "[ AUDIO OUTPUT BUS // VOCALIZING ]"
               : jarvisState === "error"
-              ? "[ ALERT: DIRECTIVE MALFUNCTION ]"
-              : "[ SYSTEM: STANDBY // TAP GLOBE TO ENGAGE ]"}
+              ? "[ DIRECTIVE MALFUNCTION // VERIFY GATEWAY ]"
+              : "[ SYSTEM: STANDBY // READY FOR DIRECTIVE ]"}
           </span>
         </div>
       </main>
 
-      {/* BOTTOM HUD READOUT & DOCK */}
-      <footer className="relative z-10 flex flex-col items-center px-6 pb-6 pt-2 border-t border-cyan-950/60 bg-neutral-950/60 backdrop-blur-md">
-        {/* Holographic Speech Transcript Readout */}
-        <div className="w-full max-w-2xl min-h-[70px] max-h-[140px] overflow-y-auto mb-4 p-3.5 rounded-xl bg-neutral-950/80 border border-cyan-500/30 shadow-[inset_0_0_20px_rgba(6,182,212,0.06)]">
+      {/* BOTTOM HUD INTERFACE */}
+      <footer className="relative z-10 flex flex-col items-center px-4 pb-4 pt-2 border-t border-cyan-950/70 bg-neutral-950/60 backdrop-blur-md">
+        {/* Holographic HUD Speech Readout */}
+        <div className="w-full max-w-xl max-h-[110px] min-h-[64px] overflow-y-auto mb-3 p-3 rounded-xl bg-neutral-950/90 border border-cyan-500/30 shadow-[inset_0_0_20px_rgba(6,182,212,0.06)]">
           {userTranscript && (
-            <div className="text-xs text-neutral-400 mb-1.5 flex items-center space-x-1.5">
+            <div className="text-[11px] text-neutral-400 mb-1 flex items-center space-x-1.5">
               <span className="text-cyan-400 font-bold">DIRECTIVE:</span>
               <span className="text-neutral-200 italic">"{userTranscript}"</span>
             </div>
@@ -387,53 +456,48 @@ export const App: React.FC = () => {
           </div>
         </div>
 
-        {/* Optional Directive Command Input Bar */}
-        {showCommandLine && (
-          <form
-            onSubmit={handleCommandSubmit}
-            className="w-full max-w-2xl flex items-center space-x-2 mb-3"
-          >
-            <div className="relative flex-1">
-              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-cyan-400 text-xs font-bold font-mono">
-                &gt;
-              </span>
-              <input
-                type="text"
-                value={commandInput}
-                onChange={(e) => setCommandInput(e.target.value)}
-                placeholder="Enter command directive (e.g. 'Status report', 'Open https://...')..."
-                className="w-full pl-7 pr-3 py-2 text-xs bg-neutral-950 border border-cyan-500/40 rounded-lg text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 font-mono transition"
-              />
-            </div>
-            <button
-              type="submit"
-              disabled={!commandInput.trim()}
-              className="px-3.5 py-2 text-xs font-bold text-cyan-950 bg-cyan-400 hover:bg-cyan-300 rounded-lg transition disabled:opacity-30"
-            >
-              <Send className="w-3.5 h-3.5" />
-            </button>
+        {/* ALWAYS-VISIBLE Directive Input Bar & Mic Engagement */}
+        <div className="w-full max-w-xl flex items-center space-x-2">
+          {/* Directive Command Input */}
+          <form onSubmit={handleDirectiveSubmit} className="relative flex-1">
+            <span className="absolute left-3 top-1/2 -translate-y-1/2 text-cyan-400 text-xs font-bold font-mono">
+              &gt;
+            </span>
+            <input
+              type="text"
+              value={directiveInput}
+              onChange={(e) => setDirectiveInput(e.target.value)}
+              placeholder='Enter directive (e.g. "Status report", "Summarize https://...")...'
+              className="w-full pl-7 pr-10 py-2.5 text-xs bg-neutral-950 border border-cyan-500/40 rounded-xl text-neutral-100 placeholder-neutral-500 focus:outline-none focus:border-cyan-400 focus:ring-1 focus:ring-cyan-400 font-mono transition"
+            />
+            {directiveInput.trim() && (
+              <button
+                type="submit"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-cyan-400 hover:text-cyan-200 transition"
+              >
+                <Send className="w-3.5 h-3.5" />
+              </button>
+            )}
           </form>
-        )}
 
-        {/* Voice Engagement Controls */}
-        <div className="flex items-center space-x-4">
+          {/* Central Holographic Mic Button */}
           <button
             onClick={handleToggleListening}
-            className={`relative flex items-center justify-center w-14 h-14 rounded-full border transition-all duration-300 ${
+            className={`relative flex items-center justify-center w-11 h-11 rounded-xl border transition-all duration-300 flex-shrink-0 ${
               jarvisState === "listening"
-                ? "bg-cyan-500 text-neutral-950 border-cyan-300 shadow-[0_0_25px_rgba(6,182,212,0.8)] scale-110"
-                : "bg-cyan-950/60 hover:bg-cyan-900/60 text-cyan-400 border-cyan-500/40 hover:border-cyan-400 hover:scale-105"
+                ? "bg-cyan-500 text-neutral-950 border-cyan-300 shadow-[0_0_20px_rgba(6,182,212,0.9)] scale-105"
+                : "bg-cyan-950/70 hover:bg-cyan-900/70 text-cyan-400 border-cyan-500/40 hover:border-cyan-400"
             }`}
-            title={jarvisState === "listening" ? "Stop Listening" : "Engage Voice Directive"}
+            title={jarvisState === "listening" ? "Stop Listening & Send" : "Click to Speak"}
           >
             {jarvisState === "listening" ? (
-              <MicOff className="w-6 h-6 animate-pulse" />
+              <MicOff className="w-5 h-5 animate-pulse" />
             ) : (
-              <Mic className="w-6 h-6" />
+              <Mic className="w-5 h-5" />
             )}
-            {/* Pulsing ring indicator */}
+            {/* Visual audio pulse ring */}
             {jarvisState === "listening" && (
-              <span className="absolute -inset-1 rounded-full border border-cyan-400 animate-ping pointer-events-none" />
+              <span className="absolute -inset-1 rounded-xl border border-cyan-400 animate-ping pointer-events-none" />
             )}
           </button>
         </div>
