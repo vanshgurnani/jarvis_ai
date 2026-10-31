@@ -1,0 +1,40 @@
+# Python Virtual Environments
+.venv/
+venv/
+bvenv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+*.env
+*.local
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+friday.db
+
+# Logs
+logs/
+*.log
+
+# OS & Editor
+.DS_Store
+.vscode/
+.idea/
+
