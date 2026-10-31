@@ -156,10 +156,17 @@ export const App: React.FC = () => {
       } catch {
         // Ignore if already started
       }
-    } catch (err) {
+    } catch (err: any) {
       console.warn("Microphone access failed:", err);
       setJarvisState("error");
-      setJarvisSpeech("Microphone permission required for vocal directives, sir. You can also type directly in the directive bar below.");
+      const isDenied = err?.name === "NotAllowedError" || err?.name === "PermissionDeniedError";
+      if (isDenied) {
+        setJarvisSpeech(
+          "⚠️ Microphone permission denied. Please grant microphone access in macOS System Settings > Privacy & Security > Microphone (enable J.A.R.V.I.S. or your terminal/browser), then tap again."
+        );
+      } else {
+        setJarvisSpeech(`⚠️ Microphone input error: ${err?.message || err}. You can also type directives below.`);
+      }
     }
   };
 
