@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { X, Settings as SettingsIcon, Check, Key, Globe, Cpu, RefreshCw } from "lucide-react";
-import { LLMSettings, fetchLLMSettings, updateLLMSettings } from "../lib/api";
+import { fetchLLMSettings, updateLLMSettings } from "../lib/api";
 
 interface SettingsModalProps {
   isOpen: boolean;
