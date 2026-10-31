@@ -53,7 +53,7 @@ pub fn run() {
                         println!("🛑 Terminating FRIDAY Backend sidecar child process...");
                         let _ = child.kill();
                     }
-                }
+                };
             }
         })
         .run(tauri::generate_context!())
